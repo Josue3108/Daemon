@@ -9,196 +9,177 @@
 #include <time.h>
 #include <errno.h>
 #include <sys/file.h>
+#include <dirent.h>
 
-// Definir F_TLOCK si no está disponible
 #ifndef F_TLOCK
 #define F_TLOCK 2
 #endif
 
-// Definir F_ULOCK si no está disponible  
 #ifndef F_ULOCK
 #define F_ULOCK 0
 #endif
 
-// Variables globales
 static char *pid_file_name = "/tmp/hello_daemon.pid";
 static int pid_fd = -1;
 static volatile int running = 1;
 static FILE *log_file = NULL;
+static const char *thermal_path = "/sys/class/thermal/";
 
-// Tu función daemonize original
+#define TEMP_THRESHOLD 65000  // 65.0 C en miligrados
+
 static void daemonize()
 {
     pid_t pid = 0;
     int fd;
-    
-    /* Fork off the parent process */
+
     pid = fork();
-    if (pid < 0) {
-        exit(EXIT_FAILURE);
-    }
-    if (pid > 0) {
-        exit(EXIT_SUCCESS);
-    }
-    
-    /* On success: The child process becomes session leader */
-    if (setsid() < 0) {
-        exit(EXIT_FAILURE);
-    }
-    
-    /* Ignore signal sent from child to parent process */
+    if (pid < 0) exit(EXIT_FAILURE);
+    if (pid > 0) exit(EXIT_SUCCESS);
+
+    if (setsid() < 0) exit(EXIT_FAILURE);
+
     signal(SIGCHLD, SIG_IGN);
-    
-    /* Fork off for the second time*/
+
     pid = fork();
-    if (pid < 0) {
-        exit(EXIT_FAILURE);
-    }
-    if (pid > 0) {
-        exit(EXIT_SUCCESS);
-    }
-    
-    /* Set new file permissions */
+    if (pid < 0) exit(EXIT_FAILURE);
+    if (pid > 0) exit(EXIT_SUCCESS);
+
     umask(0);
-    
-    /* Change the working directory to the root directory */
+
     chdir("/");
-    
-    /* Close all open file descriptors */
-    for (fd = sysconf(_SC_OPEN_MAX); fd > 0; fd--) {
-        close(fd);
-    }
-    
-    /* Reopen stdin (fd = 0), stdout (fd = 1), stderr (fd = 2) */
+
+    for (fd = sysconf(_SC_OPEN_MAX); fd > 0; fd--) close(fd);
+
     stdin = fopen("/dev/null", "r");
     stdout = fopen("/dev/null", "w+");
     stderr = fopen("/dev/null", "w+");
-    
-    /* Try to write PID of daemon to lockfile */
+
     if (pid_file_name != NULL) {
         char str[256];
         pid_fd = open(pid_file_name, O_RDWR|O_CREAT, 0640);
-        if (pid_fd < 0) {
-            exit(EXIT_FAILURE);
-        }
-        if (lockf(pid_fd, F_TLOCK, 0) < 0) {
-            exit(EXIT_FAILURE);
-        }
+        if (pid_fd < 0) exit(EXIT_FAILURE);
+        if (lockf(pid_fd, F_TLOCK, 0) < 0) exit(EXIT_FAILURE);
         sprintf(str, "%d\n", getpid());
         write(pid_fd, str, strlen(str));
     }
 }
 
-// Manejador de señales para terminar limpiamente
 void signal_handler(int sig)
 {
     running = 0;
 }
 
-// Función para escribir Hello World con timestamp
-void write_hello_world()
-{
-    time_t now;
-    char *time_str;
-    
-    // Abrir archivo en modo append
-    log_file = fopen("/tmp/hello_world.txt", "a");
-    if (log_file == NULL) {
-        return; // Si no puede abrir el archivo, simplemente continua
-    }
-    
-    // Obtener timestamp actual
-    time(&now);
-    time_str = ctime(&now);
-    // Remover el \n del final de ctime
-    time_str[strlen(time_str) - 1] = '\0';
-    
-    // Escribir al archivo
-    fprintf(log_file, "[%s] Hello World\n", time_str);
-    fflush(log_file); // Asegurar que se escriba inmediatamente
-    
-    // Cerrar archivo
-    fclose(log_file);
-    log_file = NULL;
-}
-
-// Función de limpieza
 void cleanup()
 {
-    if (log_file != NULL) {
-        fclose(log_file);
-    }
-    
+    if (log_file != NULL) fclose(log_file);
     if (pid_fd != -1) {
         lockf(pid_fd, F_ULOCK, 0);
         close(pid_fd);
     }
-    
-    if (pid_file_name != NULL) {
-        unlink(pid_file_name);
+    if (pid_file_name != NULL) unlink(pid_file_name);
+}
+
+int read_temp_from_file(const char *filename)
+{
+    FILE *f = fopen(filename, "r");
+    if (!f) return -1;
+    int temp = -1;
+    if (fscanf(f, "%d", &temp) != 1) {
+        fclose(f);
+        return -1;
     }
+    fclose(f);
+    return temp;
+}
+
+int get_max_cpu_temp()
+{
+    DIR *dir;
+    struct dirent *entry;
+    int max_temp = -1;
+
+    dir = opendir(thermal_path);
+    if (!dir) return -1;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "thermal_zone", 12) == 0) {
+            char temp_file[512];
+            snprintf(temp_file, sizeof(temp_file), "%s%s/temp", thermal_path, entry->d_name);
+            int temp = read_temp_from_file(temp_file);
+            if (temp > max_temp) {
+                max_temp = temp;
+            }
+        }
+    }
+    closedir(dir);
+    return max_temp;
+}
+
+void send_notification(const char *message)
+{
+    char command[512];
+    snprintf(command, sizeof(command), "notify-send 'Alerta CPU' '%s'", message);
+    system(command);
+}
+
+void write_log(int temp_milli)
+{
+    time_t now = time(NULL);
+    char *time_str = ctime(&now);
+    time_str[strlen(time_str) - 1] = '\0';  // quitar '\n'
+
+    log_file = fopen("/tmp/cpu_temp_log.txt", "a");
+    if (!log_file) return;
+
+    double temp_c = temp_milli / 1000.0;
+    fprintf(log_file, "[%s] Temperatura CPU: %.1f°C\n", time_str, temp_c);
+    fflush(log_file);
+    fclose(log_file);
 }
 
 int main(int argc, char *argv[])
 {
     int daemon_mode = 0;
-    
-    // Verificar si se quiere ejecutar como daemon
+
     if (argc > 1 && (strcmp(argv[1], "-d") == 0 || strcmp(argv[1], "--daemon") == 0)) {
         daemon_mode = 1;
     }
-    
+
     if (daemon_mode) {
         printf("Iniciando como daemon...\n");
-        printf("El daemon escribirá 'Hello World' cada 10 segundos en /tmp/hello_world.txt\n");
+        printf("El daemon registrará la temperatura máxima del CPU cada 10 segundos en /tmp/cpu_temp_log.txt\n");
         printf("Para detenerlo: kill $(cat /tmp/hello_daemon.pid)\n");
-        printf("Para ver la salida: tail -f /tmp/hello_world.txt\n");
-        
-        // Convertir a daemon
+        printf("Para ver la salida: tail -f /tmp/cpu_temp_log.txt\n");
         daemonize();
     } else {
         printf("Ejecutando en primer plano...\n");
         printf("Presiona Ctrl+C para detener\n");
-        printf("Escribiendo en /tmp/hello_world.txt cada 10 segundos...\n");
+        printf("Registrando temperatura máxima CPU cada 10 segundos...\n");
     }
-    
-    // Configurar manejador de señales
+
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
-    
-    // Escribir mensaje inicial
-    if (daemon_mode) {
-        log_file = fopen("/tmp/hello_world.txt", "a");
-        if (log_file) {
-            fprintf(log_file, "=== Daemon iniciado ===\n");
-            fclose(log_file);
-            log_file = NULL;
-        }
-    }
-    
-    // Bucle principal
+
     while (running) {
-        write_hello_world();
-        
-        if (!daemon_mode) {
-            printf("Hello World escrito al archivo\n");
+        int temp = get_max_cpu_temp();
+        if (temp >= 0) {
+            write_log(temp);
+            if (temp >= TEMP_THRESHOLD) {
+                char alert_msg[128];
+                snprintf(alert_msg, sizeof(alert_msg), "¡Temperatura alta! %.1f°C", temp / 1000.0);
+                send_notification(alert_msg);
+            }
+            if (!daemon_mode) {
+                printf("Temperatura CPU: %.1f°C\n", temp / 1000.0);
+            }
+        } else {
+            if (!daemon_mode) {
+                printf("Error leyendo temperatura CPU\n");
+            }
         }
-        
-        sleep(10); // Esperar 10 segundos
+        sleep(10);
     }
-    
-    // Escribir mensaje final
-    if (daemon_mode) {
-        log_file = fopen("/tmp/hello_world.txt", "a");
-        if (log_file) {
-            fprintf(log_file, "=== Daemon terminado ===\n");
-            fclose(log_file);
-            log_file = NULL;
-        }
-    } else {
-        printf("Programa terminado\n");
-    }
-    
+
     cleanup();
     return EXIT_SUCCESS;
 }
