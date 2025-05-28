@@ -1,0 +1,16 @@
+[Unit]
+Description=CPU Temp Logger Daemon
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=/run/cpu_temp_logger/daemon.pid
+ExecStart=/usr/bin/daemon -d
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RuntimeDirectory=cpu_temp_logger
+User=josue
+
+[Install]
+WantedBy=multi-user.target

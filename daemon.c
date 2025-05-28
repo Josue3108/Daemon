@@ -19,7 +19,7 @@
 #define F_ULOCK 0
 #endif
 
-static char *pid_file_name = "/tmp/hello_daemon.pid";
+static char *pid_file_name = "/run/cpu_temp_logger/daemon.pid";
 static int pid_fd = -1;
 static volatile int running = 1;
 static FILE *log_file = NULL;
